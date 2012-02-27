@@ -26,54 +26,12 @@ function Chunk(minv, maxv) {
     this.minv = minv; this.maxv = maxv;
 }
 
+
 function makeBam(data, bai, callback) {
     var bam = new BamFile();
     bam.data = data;
     bam.bai = bai;
-
-    bam.data.slice(0, 65536).fetch(function(r) {
-        if (!r) {
-            return dlog("Couldn't access BAM");
-        }
-
-        var unc = unbgzf(r);
-        var uncba = new Uint8Array(unc);
-
-        var magic = readInt(uncba, 0);
-        var headLen = readInt(uncba, 4);
-        var header = '';
-        for (var i = 0; i < headLen; ++i) {
-            header += String.fromCharCode(uncba[i + 8]);
-        }
-
-        var nRef = readInt(uncba, headLen + 8);
-        var p = headLen + 12;
-
-        bam.chrToIndex = {};
-        bam.indexToChr = [];
-        for (var i = 0; i < nRef; ++i) {
-            var lName = readInt(uncba, p);
-            var name = '';
-            for (var j = 0; j < lName-1; ++j) {
-                name += String.fromCharCode(uncba[p + 4 + j]);
-            }
-            var lRef = readInt(uncba, p + lName + 4);
-            // dlog(name + ': ' + lRef);
-            bam.chrToIndex[name] = i;
-            if (name.indexOf('chr') == 0) {
-                bam.chrToIndex[name.substring(3)] = i;
-            } else {
-                bam.chrToIndex['chr' + name] = i;
-            }
-            bam.indexToChr.push(name);
-
-            p = p + 8 + lName;
-        }
-
-        if (bam.indices) {
-            return callback(bam);
-        }
-    });
+    bam.readBamHeader(callback);
 
     bam.bai.fetch(function(header) {   // Do we really need to fetch the whole thing? :-(
         if (!header) {
@@ -111,6 +69,89 @@ function makeBam(data, bai, callback) {
     });
 }
 
+
+BamFile.prototype.readBamHeader = function(callback, uncSize)  {
+    var sliceSize = uncSize;
+    var padmax = (1<<16);
+    if (! sliceSize)  {  
+        sliceSize = 32000;
+    }
+    var bam = this;
+    // not sure why this is needed for padding out sliceSize, but otherwise get inflate.js errors
+    //    see tramp(), where same problem is encountered
+    // probably don't need full 64KB padding, just need to round paddedSize up to nearest multiple of 64KB?
+    // var extra = 65536;   // 64KB padding (1<<16)
+
+    var paddedSize;
+    if (sliceSize <= padmax)  { paddedSize = sliceSize + padmax; }   // under 64K, add 64K pad
+    else { paddedSize = sliceSize + (padmax - (sliceSize % padmax)); }   // over 64K, pad up to nearest 64K multiple
+    // bam.data.slice(0, 65536).fetch(function(r) {  // fails in cases where BAM header > 64k
+    bam.data.slice(0, paddedSize).fetch(function(r) {
+        if (!r) {
+            return dlog("Couldn't access BAM");
+        }
+        // var unc = unbgzf(r);  // fails silently when BAM header > 64KB (pads returned array after 64K with 0s)
+        var unc = unbgzf(r, sliceSize);   // fails unless paddedSize >=  (sliceSize + 64KB)  (or + nearest 64K multiple if sliceSize < 64K)
+        var buflength = unc.byteLength;
+        var uncba = new Uint8Array(unc);
+
+        var magic = readInt(uncba, 0);
+        var headLen = readInt(uncba, 4);  // length of following text header
+
+        /*  need to consider case where header + ref seq section don't fit into 64K
+            reference sequence section of BAM file shouldn't be any bigger than plain text header section (headLen)
+            (since info is repeated in plain text header in more verbose format), so both together should be < 2*headLen
+            Therefore make sure buffer used is > 2*header_length
+            
+            not sure how to do this accurately since data is compressed, so guarantee uncompressed will be > 2*hl by loading 
+            compressed > 2*hl
+            
+            */
+        var p = headLen + 8;   // magic(4b) + headLen(4b) + headLen val;
+        if ((p * 2) > buflength)  {
+            var newSliceSize = p * 2;
+            // var newExtra = (1<<16) - (sliceSize % (1<<16));  // round to nearest 64KB padding ???
+            // console.log("RETRYING readBamHeader with bigger slice: " + newSliceSize);
+            return bam.readBamHeader(callback, newSliceSize);
+        }
+        var header = '';
+        for (var i = 0; i < headLen; ++i) {
+            header += String.fromCharCode(uncba[i + 8]);
+        }
+        var nRef = readInt(uncba, headLen + 8);
+        // console.log("number of seqs: " + nRef);
+        var p = headLen + 12;  // magic(4b) + headLen(4b) + headLen val + nRef(4b)
+
+        bam.chrToIndex = {};
+        bam.indexToChr = [];
+        bam.chroms = [];
+        for (var i = 0; i < nRef; ++i) {
+            var lName = readInt(uncba, p);
+            var name = '';
+            for (var j = 0; j < lName-1; ++j) {
+                name += String.fromCharCode(uncba[p + 4 + j]);
+            }
+            var lRef = readInt(uncba, p + lName + 4);
+            // dlog(name + ': ' + lRef);
+            bam.chrToIndex[name] = i;
+
+            if (name.indexOf('chr') == 0) {
+                bam.chrToIndex[name.substring(3)] = i;
+            } else {
+                bam.chrToIndex['chr' + name] = i;
+            }
+            bam.indexToChr.push(name);
+            var chrom = { name: name, seqlength: lRef };
+            bam.chroms.push(chrom);
+
+            p = p + 8 + lName;
+        }
+
+        if (bam.indices) {
+            return callback(bam);
+        }
+    });
+}
 
 
 BamFile.prototype.blocksForRange = function(refId, min, max) {
@@ -411,9 +452,13 @@ function unbgzf(data, lim) {
 
     while (ptr[0] < lim) {
         var ba = new Uint8Array(data, ptr[0], 100); // FIXME is this enough for all credible BGZF block headers?
-        var xlen = (ba[11] << 8) | (ba[10]);
-        // dlog('xlen[' + (ptr[0]) +']=' + xlen);
-        var unc = jszlib_inflate_buffer(data, 12 + xlen + ptr[0], Math.min(65536, data.byteLength - 12 - xlen - ptr[0]), ptr);
+        var xlen = (ba[11] << 8) | (ba[10]);   // (XLEN field in BGZF format)
+        var start =  12 + xlen + ptr[0]
+        var length = Math.min(65536, data.byteLength - start);
+        
+        // var unc = jszlib_inflate_buffer(data, 12 + xlen + ptr[0], Math.min(65536, data.byteLength - 12 - xlen - ptr[0]), ptr);
+        var unc = jszlib_inflate_buffer(data, start, length, ptr);
+
         ptr[0] += 8;
         totalSize += unc.byteLength;
         oBlockList.push(unc);
