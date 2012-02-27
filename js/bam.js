@@ -292,12 +292,26 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
         var p = offset + 36 + nl;
 
         var cigar = '';
+        var lref = 0;  
         for (var c = 0; c < nc; ++c) {
             var cigop = readInt(ba, p);
-            cigar = cigar + (cigop>>4) + CIGAR_DECODER[cigop & 0xf];
+            // cigar = cigar + (cigop>>4) + CIGAR_DECODER[cigop & 0xf];
+            var lop = (cigop>>4);  
+            var op = CIGAR_DECODER[cigop & 0xf]; 
+            cigar = cigar + lop + op;  
+            switch (op) {   
+		case 'M':
+		case 'D':
+		case 'N':
+		case '=':
+		case 'X':
+		    lref += lop;
+		    break;
+		} 
             p += 4;
         }
         record.cigar = cigar;
+        record.lref = lref;  // length from start to end of read alignment span on reference sequence
     
         var seq = '';
         var seqBytes = (lseq + 1) >> 1;
@@ -356,8 +370,11 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
             }
             record[tag] = value;
         }
-
-        if (!min || record.pos <= max && record.pos + lseq >= min) {
+	// use length of alignment along reference (lref) calculated from CIGAR, rather than seq length
+        if (!min || ((record.pos <= max) && (record.pos + record.lref >= min))) {   
+        // half-closed half-open coords? [---)  
+        // if so then according to https://lists.soe.ucsc.edu/pipermail/genome/2006-January/009571.html 
+        //    should use "<" and ">" rather than "<=" and ">=" ??? 
             if (chrId === undefined || refID == chrId) {
                 sink.push(record);
             }
