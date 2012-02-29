@@ -317,6 +317,7 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
         var flag_nc = readInt(ba, offset + 16);
         var flag = (flag_nc & 0xffff0000) >> 16;
         var nc = flag_nc & 0xffff;
+        record.flag = flag;
     
         var lseq = readInt(ba, offset + 20);
         
@@ -329,7 +330,6 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
         for (var j = 0; j < nl-1; ++j) {
             readName += String.fromCharCode(ba[offset + 36 + j]);
         }
-    
         var p = offset + 36 + nl;
 
         var cigar = '';
@@ -411,6 +411,7 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
             }
             record[tag] = value;
         }
+
 	// use length of alignment along reference (lref) calculated from CIGAR, rather than seq length
         if (!min || ((record.pos <= max) && (record.pos + record.lref >= min))) {   
         // half-closed half-open coords? [---)  
@@ -422,7 +423,6 @@ BamFile.prototype.readBamRecords = function(ba, offset, sink, min, max, chrId) {
         }
         offset = blockEnd;
     }
-
     // Exits via top of loop.
 }
 
